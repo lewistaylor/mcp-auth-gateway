@@ -14,7 +14,9 @@ COPY server.mjs ./
 
 RUN mkdir -p /app/data && chown -R node:node /app/data
 
-USER node
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
+
 EXPOSE 8000
 
-CMD ["node", "server.mjs"]
+ENTRYPOINT ["./entrypoint.sh"]
