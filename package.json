@@ -1,7 +1,7 @@
 {
   "name": "mcp-auth-gateway",
   "version": "1.0.0",
-  "description": "OAuth 2.1 auth gateway for MCP servers — validates JWTs from Auth0 and proxies to internal services",
+  "description": "Self-hosted OAuth 2.1 auth gateway for MCP servers — embeds @mcpauth/auth and proxies to internal services",
   "type": "module",
   "private": true,
   "scripts": {
@@ -12,7 +12,11 @@
     "node": ">=22"
   },
   "dependencies": {
-    "express": "^5.2.1",
-    "mcp-auth": "^0.2.0"
+    "@mcpauth/auth": "^0.1.4",
+    "better-sqlite3": "^12.9.0",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.22.1",
+    "jose": "^6.2.2",
+    "kysely": "^0.28.16"
   }
 }
