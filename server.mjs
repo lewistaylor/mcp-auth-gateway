@@ -115,19 +115,38 @@ db.close();
 
 const rawAdapter = SqliteAdapter(DATABASE_PATH);
 
+// Workaround: @mcpauth/auth's getClient rejects confidential clients when no
+// secret is supplied. The authorize endpoint legitimately calls getClient(id)
+// without a secret (per OAuth 2.1 — secret verification happens at the token
+// endpoint, not the authorization endpoint). We fall back to a direct DB lookup
+// for the no-secret case so that confidential clients can be identified.
+const lookupDb = new Database(DATABASE_PATH, { readonly: true });
+const lookupStmt = lookupDb.prepare(
+  "SELECT * FROM oauth_client WHERE client_id = ?",
+);
+
+function clientRowToObject(row) {
+  if (!row) return null;
+  const parse = (v) => { try { return JSON.parse(v); } catch { return v; } };
+  return {
+    id: row.id,
+    clientId: row.client_id,
+    clientSecret: row.client_secret,
+    name: row.name,
+    redirectUris: parse(row.redirect_uris),
+    grantTypes: parse(row.grant_types),
+    scope: row.scope || undefined,
+    tokenEndpointAuthMethod: row.token_endpoint_auth_method,
+  };
+}
+
 const adapter = {
   ...rawAdapter,
   async getClient(clientId, clientSecret) {
-    console.log(`[auth-gateway] getClient called: clientId=${clientId}`);
-    const result = await rawAdapter.getClient(clientId, clientSecret);
-    console.log(`[auth-gateway] getClient result: ${result ? "found" : "NOT FOUND"}`);
-    return result;
-  },
-  async registerClient(params) {
-    console.log(`[auth-gateway] registerClient called: name=${params.client_name}, auth_method=${params.token_endpoint_auth_method}`);
-    const result = await rawAdapter.registerClient(params);
-    console.log(`[auth-gateway] registerClient result: client_id=${result.client_id}`);
-    return result;
+    if (clientSecret != null) {
+      return rawAdapter.getClient(clientId, clientSecret);
+    }
+    return clientRowToObject(lookupStmt.get(clientId));
   },
 };
 
