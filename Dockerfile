@@ -12,8 +12,7 @@ RUN npm ci --omit=dev
 
 COPY server.mjs ./
 
-RUN mkdir -p /data && chown node:node /data
-VOLUME /data
+RUN mkdir -p /app/data && chown -R node:node /app/data
 
 USER node
 EXPOSE 8000

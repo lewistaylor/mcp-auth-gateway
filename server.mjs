@@ -63,9 +63,9 @@ const publicKey = createPublicKey(privateKey);
 
 // ── Database bootstrap ──────────────────────────────────────────────────────
 
-mkdirSync(dirname(DATABASE_PATH), { recursive: true });
-
 import Database from "better-sqlite3";
+
+mkdirSync(dirname(DATABASE_PATH), { recursive: true });
 
 const db = new Database(DATABASE_PATH);
 db.pragma("journal_mode = WAL");
@@ -113,8 +113,26 @@ db.close();
 
 // ── @mcpauth/auth setup ─────────────────────────────────────────────────────
 
+const rawAdapter = SqliteAdapter(DATABASE_PATH);
+
+const adapter = {
+  ...rawAdapter,
+  async getClient(clientId, clientSecret) {
+    console.log(`[auth-gateway] getClient called: clientId=${clientId}`);
+    const result = await rawAdapter.getClient(clientId, clientSecret);
+    console.log(`[auth-gateway] getClient result: ${result ? "found" : "NOT FOUND"}`);
+    return result;
+  },
+  async registerClient(params) {
+    console.log(`[auth-gateway] registerClient called: name=${params.client_name}, auth_method=${params.token_endpoint_auth_method}`);
+    const result = await rawAdapter.registerClient(params);
+    console.log(`[auth-gateway] registerClient result: client_id=${result.client_id}`);
+    return result;
+  },
+};
+
 const mcpAuthConfig = {
-  adapter: SqliteAdapter(DATABASE_PATH),
+  adapter,
   issuerUrl: BASE_URL,
   issuerPath: "/api/oauth",
   serverOptions: {
@@ -257,6 +275,10 @@ app.get("/.well-known/oauth-protected-resource*", (_req, res) => {
 
 app.use(
   "/api/oauth",
+  (req, _res, next) => {
+    console.log(`[auth-gateway] ${req.method} ${req.originalUrl}`);
+    next();
+  },
   express.json(),
   express.urlencoded({ extended: true }),
   mcpAuth,
