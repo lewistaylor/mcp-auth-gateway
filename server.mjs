@@ -148,6 +148,16 @@ const adapter = {
     }
     return clientRowToObject(lookupStmt.get(clientId));
   },
+  async registerClient(params) {
+    // Force all clients to public (PKCE-only). @mcpauth/auth has a bug where
+    // confidential client DCR returns the bcrypt hash instead of the plaintext
+    // secret, breaking the token exchange. Public clients with PKCE are the
+    // correct model for user-facing MCP clients anyway.
+    return rawAdapter.registerClient({
+      ...params,
+      token_endpoint_auth_method: "none",
+    });
+  },
 };
 
 const mcpAuthConfig = {
