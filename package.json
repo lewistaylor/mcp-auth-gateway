@@ -1,0 +1,18 @@
+{
+  "name": "mcp-auth-gateway",
+  "version": "1.0.0",
+  "description": "OAuth 2.1 auth gateway for MCP servers — validates JWTs from Auth0 and proxies to internal services",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/gateway.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "mcp-auth": "^0.2.0"
+  }
+}
