@@ -341,6 +341,8 @@ async function validateAndProxy(req, res) {
   const targetHost = `${service}${INTERNAL_SUFFIX}`;
   const targetPath = req.url || "/";
 
+  console.log(`[proxy] ${service}: ${req.method} ${targetPath} → ${targetHost}:${INTERNAL_PORT}`);
+
   const proxyReq = httpRequest(
     {
       hostname: targetHost,
@@ -356,7 +358,7 @@ async function validateAndProxy(req, res) {
   );
 
   proxyReq.on("error", (err) => {
-    console.error(`[proxy] ${service}: ${err.message}`);
+    console.error(`[proxy] ${service}: ${err.code || "UNKNOWN"} → ${targetHost}:${INTERNAL_PORT}${targetPath} — ${err.message}`);
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(
