@@ -42,6 +42,44 @@ const INTERNAL_SUFFIX =
   process.env.INTERNAL_SUFFIX || "-mcp.railway.internal";
 const INTERNAL_PORT = parseInt(process.env.INTERNAL_PORT || "8000", 10);
 
+/**
+ * Paths that should be proxied WITHOUT requiring a Bearer token.
+ *
+ * Format: comma-separated list of `<service>:<path>` pairs, where `<path>`
+ * is the exact path on the upstream service (i.e. after the `/<service>`
+ * prefix has been stripped by Express mount routing). Query strings are
+ * ignored during matching.
+ *
+ * Example (enables Gmail's server-side OAuth consent flow):
+ *   PUBLIC_SERVICE_PATHS=gmail:/oauth2callback,gmail:/auth/start
+ *
+ * Use with care — any path listed here is exposed to the public internet
+ * without MCP OAuth 2.1 authentication. Only use for endpoints that either
+ * (a) are safe to invoke anonymously (e.g. OAuth callbacks, which are
+ * secured by state/PKCE at the application layer), or (b) implement their
+ * own application-layer authentication.
+ */
+const PUBLIC_SERVICE_PATHS = new Set(
+  (process.env.PUBLIC_SERVICE_PATHS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0),
+);
+if (PUBLIC_SERVICE_PATHS.size > 0) {
+  console.log(
+    `[auth-gateway] Public service paths (bypass Bearer auth): ${[...PUBLIC_SERVICE_PATHS].join(", ")}`,
+  );
+}
+
+/**
+ * Returns true if the given (service, path) pair is configured to bypass
+ * Bearer token validation. Matches the exact path — no prefix matching or
+ * wildcards — to prevent accidental exposure of adjacent endpoints.
+ */
+export function isPublicServicePath(service, path) {
+  return PUBLIC_SERVICE_PATHS.has(`${service}:${path}`);
+}
+
 for (const v of [
   "BASE_URL",
   "GATEWAY_USERNAME",
@@ -320,28 +358,38 @@ app.use("/.well-known", mcpAuth);
  * Validates the Bearer token against the @mcpauth/auth database
  * and proxies authenticated requests to the target backend.
  * No body parsing — the raw request stream is piped through.
+ *
+ * Paths listed in `PUBLIC_SERVICE_PATHS` bypass Bearer validation — the
+ * upstream service is expected to handle those requests safely on its own
+ * (e.g. OAuth consent callbacks secured by state/PKCE at the app layer).
  */
 async function validateAndProxy(req, res) {
-  const session = await validateToken(req);
-  if (!session) {
-    res.writeHead(401, {
-      "Content-Type": "application/json",
-      "WWW-Authenticate": "Bearer",
-    });
-    return res.end(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        error: { code: -32001, message: "Unauthorized" },
-        id: null,
-      }),
-    );
+  const service = req.params.service;
+  const isPublic = isPublicServicePath(service, req.path);
+
+  if (!isPublic) {
+    const session = await validateToken(req);
+    if (!session) {
+      res.writeHead(401, {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": "Bearer",
+      });
+      return res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Unauthorized" },
+          id: null,
+        }),
+      );
+    }
   }
 
-  const service = req.params.service;
   const targetHost = `${service}${INTERNAL_SUFFIX}`;
   const targetPath = req.url || "/";
 
-  console.log(`[proxy] ${service}: ${req.method} ${targetPath} → ${targetHost}:${INTERNAL_PORT}`);
+  console.log(
+    `[proxy]${isPublic ? " (public)" : ""} ${service}: ${req.method} ${targetPath} → ${targetHost}:${INTERNAL_PORT}`,
+  );
 
   const proxyReq = httpRequest(
     {

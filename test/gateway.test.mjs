@@ -16,6 +16,17 @@ const FAKE_BACKEND_PORT = 19876;
 const GATEWAY_PORT = 19877;
 const VALID_TOKEN = "test-valid-token";
 
+/**
+ * Mirrors the real server.mjs PUBLIC_SERVICE_PATHS env var — lists
+ * `<service>:<path>` pairs that bypass Bearer validation. Kept as a
+ * constant in tests so the behaviour can be asserted without spinning
+ * up a full Railway environment.
+ */
+const PUBLIC_SERVICE_PATHS = new Set([
+  "gmail:/oauth2callback",
+  "gmail:/auth/start",
+]);
+
 let fakeBackend;
 let gateway;
 
@@ -69,6 +80,10 @@ function startGateway() {
     app.get("/health", (_req, res) => res.send("ok"));
 
     const stubAuth = (req, res, next) => {
+      const service = req.params.service;
+      if (PUBLIC_SERVICE_PATHS.has(`${service}:${req.path}`)) {
+        return next();
+      }
       const authHeader = req.headers.authorization || "";
       if (authHeader !== `Bearer ${VALID_TOKEN}`) {
         res.writeHead(401, { "Content-Type": "application/json" });
@@ -187,5 +202,37 @@ describe("auth gateway", () => {
   it("CORS headers are present on responses", async () => {
     const res = await fetch("/health");
     assert.equal(res.headers.get("access-control-allow-origin"), "*");
+  });
+
+  // ── Public service paths ───────────────────────────────────────────────
+
+  it("allows unauthenticated access to configured public service paths", async () => {
+    const res = await fetch("/gmail/oauth2callback?code=abc&state=xyz");
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.proxied, true);
+    assert.equal(body.url, "/oauth2callback?code=abc&state=xyz");
+  });
+
+  it("proxies /auth/start without Bearer token when listed in PUBLIC_SERVICE_PATHS", async () => {
+    const res = await fetch("/gmail/auth/start?setup_token=secret");
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.url, "/auth/start?setup_token=secret");
+  });
+
+  it("still requires Bearer for non-public paths on services with public paths", async () => {
+    const res = await fetch("/gmail/mcp", { method: "POST" });
+    assert.equal(res.status, 401);
+  });
+
+  it("matches paths exactly — adjacent paths are NOT public", async () => {
+    const res = await fetch("/gmail/oauth2callback/extra");
+    assert.equal(res.status, 401);
+  });
+
+  it("does not leak public-path bypass to other services", async () => {
+    const res = await fetch("/xero/oauth2callback");
+    assert.equal(res.status, 401);
   });
 });

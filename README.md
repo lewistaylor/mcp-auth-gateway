@@ -43,6 +43,22 @@ example, `/charlie/mcp` routes to `charlie-mcp.railway.internal:8000/mcp`.
 | `PORT` | No | `8000` | Listen port |
 | `INTERNAL_SUFFIX` | No | `-mcp.railway.internal` | Backend DNS suffix |
 | `INTERNAL_PORT` | No | `8000` | Backend port (must match backend services) |
+| `PUBLIC_SERVICE_PATHS` | No | _empty_ | Comma-separated `<service>:<path>` pairs proxied without Bearer auth (see below) |
+
+### Public service paths
+
+Some upstream services expose endpoints that legitimately need to be reachable
+without a Bearer token — most commonly, OAuth callback URLs that are invoked
+by a third-party identity provider's browser redirect. For those, set:
+
+```
+PUBLIC_SERVICE_PATHS=gmail:/oauth2callback,gmail:/auth/start
+```
+
+Path matching is **exact** (no prefixes, no wildcards). Query strings are
+ignored. Only list paths whose upstream implementation is safe to expose
+publicly — typically endpoints already protected by application-layer
+mechanisms such as OAuth `state`/PKCE validation or a shared setup token.
 
 ## Generate secrets
 
