@@ -45,6 +45,7 @@ example, `/charlie/mcp` routes to `charlie-mcp.railway.internal:8000/mcp`.
 | `INTERNAL_PORT` | No | `8000` | Backend port (must match backend services) |
 | `PUBLIC_SERVICE_PATHS` | No | _empty_ | Comma-separated `<service>:<path>` pairs proxied without Bearer auth (see below) |
 | `MCPAUTH_ACCESS_TOKEN_LIFETIME` | No | `86400` | Access token lifetime, seconds. See [Token lifetimes](#token-lifetimes). |
+| `MCPAUTH_REFRESH_TOKEN_LIFETIME` | No | `2592000` | Refresh token lifetime, seconds (default 30 days) |
 | `UPSTREAM_TIMEOUT_MS` | No | `30000` | Proxy request timeout before returning 502 |
 | `BACKEND_SERVICES` | No | _empty_ | Comma-separated list of backend service names (without `-mcp` suffix) that `/health` should probe, e.g. `gmail,gmail-work,notion,xero` |
 | `HEALTH_CHECK_TIMEOUT_MS` | No | `2000` | Per-backend timeout for the `/health` readiness probe |
@@ -232,9 +233,29 @@ Bodies — request and response — are **never** logged. Gmail / Xero
 content is considered sensitive.
 
 In addition, the gateway emits a separate `auth rejected` log line
-the moment a Bearer validation fails, with `reason`, `srcIp`, `path`,
-and `userAgent`. This is the trail to grep when watching for
-credential stuffing or scanner traffic.
+the moment a Bearer validation fails, with these fields:
+
+| Field | Notes |
+|---|---|
+| `srcIp` | Client IP |
+| `path` | Gateway path being probed |
+| `reason` | One of: `no-bearer-header`, `malformed-bearer`, `unknown-to-db`, `expired`, `lookup-failed`, `bad-expiry` |
+| `hasBearer` | Whether an `Authorization: Bearer …` header was present |
+| `tokenPrefix` | First 6 characters of the token (for correlating repeat offenders — **never** the full token) |
+| `userAgent` | Client UA string |
+
+This is the trail to grep when:
+
+- **Watching for "Gmail drops out"** — `reason:"expired"` means the
+  client's refresh flow failed / didn't run in time.
+- **Watching for credential stuffing or scanner traffic** —
+  `reason:"unknown-to-db"` or `reason:"no-bearer-header"` from an
+  unexpected `srcIp` / `userAgent`.
+- **Diagnosing client misconfigurations** — `reason:"malformed-bearer"`
+  usually means the client is setting the header but sending an empty
+  token (config-file typo, unset env var).
+- **Spotting infra issues** — `reason:"lookup-failed"` means the
+  SQLite store threw during the auth path; alert on this.
 
 ### `/health` contract
 
@@ -268,14 +289,15 @@ and `waitedMs`.
 | Token | Default | Env var | Notes |
 |---|---|---|---|
 | Access token | 24h (86400s) | `MCPAUTH_ACCESS_TOKEN_LIFETIME` | Override to shorten if you need tighter revocation windows |
-| Refresh token | 14d | _not configurable_ | Hard-coded in `server.mjs` |
+| Refresh token | 30d (2592000s) | `MCPAUTH_REFRESH_TOKEN_LIFETIME` | Governs how often a client must redo the full OAuth flow |
 
-The 24-hour default is a tradeoff: longer-lived access tokens reduce
-session churn for long-running agent clients (Claude Desktop, Cursor)
-but give a larger blast radius if one leaks and a longer window
-before a compromised client gets cut off. If that tradeoff matters
-for your deployment, set `MCPAUTH_ACCESS_TOKEN_LIFETIME=3600` (or
-shorter) and rely on refresh-token rotation.
+The 24-hour / 30-day defaults are a tradeoff: longer-lived tokens
+reduce session churn for long-running agent clients (Claude Desktop,
+Cursor) but give a larger blast radius if one leaks and a longer
+window before a compromised client gets cut off. If that tradeoff
+matters for your deployment, set `MCPAUTH_ACCESS_TOKEN_LIFETIME=3600`
+(or shorter) and/or `MCPAUTH_REFRESH_TOKEN_LIFETIME=1209600` (14d)
+and rely on refresh-token rotation.
 
 ## Smoke test
 
