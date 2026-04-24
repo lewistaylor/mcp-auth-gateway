@@ -12,13 +12,16 @@
  * with SQLite for token/client storage.
  *
  * Route map:
- *   GET  /                                → health check
- *   GET  /health                          → health check
+ *   GET  /                                → liveness probe (plain "ok")
+ *   GET  /health                          → readiness probe (JSON dep status)
  *   GET  /login                           → login page
  *   POST /login                           → login handler
  *        /api/oauth/*                     → @mcpauth/auth OAuth endpoints
  *        /.well-known/*                   → @mcpauth/auth + RFC 9728 metadata
  *        /<service>/*                     → token-validated proxy to backends
+ *
+ * All proxy requests emit a single-line JSON log entry on response
+ * finish (see `logRequest`). See README.md for the field contract.
  */
 
 import express from "express";
@@ -30,6 +33,11 @@ import { createPrivateKey, createPublicKey } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import {
+  logJson,
+  classifyUpstreamError,
+  classify401,
+} from "./lib/observability.mjs";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -41,6 +49,59 @@ const DATABASE_PATH = process.env.DATABASE_PATH || "./data/db.sqlite";
 const INTERNAL_SUFFIX =
   process.env.INTERNAL_SUFFIX || "-mcp.railway.internal";
 const INTERNAL_PORT = parseInt(process.env.INTERNAL_PORT || "8000", 10);
+
+/**
+ * How long an issued access token is valid, in seconds.
+ *
+ * Default is 24h (86400). The previous value of 1h caused noticeable
+ * session churn for long-running agent use cases (Claude, Cursor).
+ * The refresh token lifetime stays at 14d, so a longer access token
+ * only shrinks the frequency at which the token endpoint is called —
+ * it does not extend the overall grant lifetime.
+ *
+ * Tradeoff: longer-lived access tokens mean a larger blast radius if
+ * one leaks, and a longer window before a compromised client is cut
+ * off. Override via MCPAUTH_ACCESS_TOKEN_LIFETIME (seconds) if that
+ * tradeoff matters for your deployment.
+ */
+const ACCESS_TOKEN_LIFETIME = parseInt(
+  process.env.MCPAUTH_ACCESS_TOKEN_LIFETIME || "86400",
+  10,
+);
+const REFRESH_TOKEN_LIFETIME = 14 * 24 * 60 * 60; // 14 days
+
+/**
+ * Upstream proxy timeout, in milliseconds. Applied via
+ * `proxyReq.setTimeout()` so the gateway does not sit on a dead
+ * upstream connection indefinitely. (Node's default socket timeout
+ * is effectively infinite — see the 15-minute 502 incident on
+ * 17 / 24 April 2026.)
+ */
+const UPSTREAM_TIMEOUT_MS = parseInt(
+  process.env.UPSTREAM_TIMEOUT_MS || "30000",
+  10,
+);
+
+/**
+ * List of backend service names (without the `-mcp` suffix) that the
+ * /health endpoint should probe for readiness. Matches the service
+ * segment used in `/<service>/...` proxy URLs. Comma-separated.
+ *
+ * Example: `BACKEND_SERVICES=gmail,gmail-work,notion,xero`
+ *
+ * Unset / empty disables upstream probing; only the SQLite check runs.
+ * Unknown services produce a 503 if they fail to respond within
+ * HEALTH_CHECK_TIMEOUT_MS.
+ */
+const BACKEND_SERVICES = (process.env.BACKEND_SERVICES || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s.length > 0);
+
+const HEALTH_CHECK_TIMEOUT_MS = parseInt(
+  process.env.HEALTH_CHECK_TIMEOUT_MS || "2000",
+  10,
+);
 
 /**
  * Paths that should be proxied WITHOUT requiring a Bearer token.
@@ -66,9 +127,11 @@ const PUBLIC_SERVICE_PATHS = new Set(
     .filter((s) => s.length > 0),
 );
 if (PUBLIC_SERVICE_PATHS.size > 0) {
-  console.log(
-    `[auth-gateway] Public service paths (bypass Bearer auth): ${[...PUBLIC_SERVICE_PATHS].join(", ")}`,
-  );
+  logJson({
+    level: "info",
+    msg: "public service paths configured",
+    paths: [...PUBLIC_SERVICE_PATHS],
+  });
 }
 
 /**
@@ -162,6 +225,9 @@ const lookupDb = new Database(DATABASE_PATH, { readonly: true });
 const lookupStmt = lookupDb.prepare(
   "SELECT * FROM oauth_client WHERE client_id = ?",
 );
+// Prepared once for the health probe so we don't pay the prepare cost on
+// every /health request.
+const healthPingStmt = lookupDb.prepare("SELECT 1 AS ok");
 
 function clientRowToObject(row) {
   if (!row) return null;
@@ -203,8 +269,8 @@ const mcpAuthConfig = {
   issuerUrl: BASE_URL,
   issuerPath: "/api/oauth",
   serverOptions: {
-    accessTokenLifetime: 3600,
-    refreshTokenLifetime: 1209600,
+    accessTokenLifetime: ACCESS_TOKEN_LIFETIME,
+    refreshTokenLifetime: REFRESH_TOKEN_LIFETIME,
   },
   authenticateUser: async (req) => {
     // @mcpauth/auth passes a framework-agnostic HttpRequest, not Express Request.
@@ -251,8 +317,105 @@ app.use((req, res, next) => {
 
 // ── Health ──────────────────────────────────────────────────────────────────
 
+/**
+ * Liveness probe — returns 200 as long as the process is accepting
+ * connections. Kept trivial so Railway's HTTP healthcheck on `/` stays
+ * fast and cheap. Use `/health` for a real readiness check.
+ */
 app.get("/", (_req, res) => res.send("ok"));
-app.get("/health", (_req, res) => res.send("ok"));
+
+/**
+ * Probes an upstream backend at `GET /` and resolves with a status
+ * descriptor. Never throws — every failure mode is captured as
+ * `{ ok: false, ... }` so the caller can serialize it directly.
+ */
+export function probeBackend(
+  service,
+  { timeoutMs = HEALTH_CHECK_TIMEOUT_MS, port = INTERNAL_PORT, suffix = INTERNAL_SUFFIX } = {},
+) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const host = `${service}${suffix}`;
+    const req = httpRequest(
+      { hostname: host, port, path: "/", method: "GET", timeout: timeoutMs },
+      (res) => {
+        const ok = res.statusCode !== undefined && res.statusCode < 500;
+        res.resume();
+        resolve({
+          service,
+          ok,
+          status: res.statusCode,
+          latencyMs: Date.now() - start,
+        });
+      },
+    );
+    req.on("timeout", () => {
+      req.destroy(Object.assign(new Error("timeout"), { code: "UPSTREAM_TIMEOUT" }));
+    });
+    req.on("error", (err) => {
+      resolve({
+        service,
+        ok: false,
+        error: classifyUpstreamError(err),
+        errorMessage: err.message,
+        latencyMs: Date.now() - start,
+      });
+    });
+    req.end();
+  });
+}
+
+/**
+ * Readiness probe. Verifies:
+ *   - SQLite is queryable (`SELECT 1`)
+ *   - Each backend in BACKEND_SERVICES responds within HEALTH_CHECK_TIMEOUT_MS
+ *
+ * Returns 200 with `{ status: "ok", checks: {...} }` when everything is
+ * healthy, 503 otherwise. Railway healthchecks can be pointed at this
+ * endpoint to restart the gateway when dependencies break.
+ */
+app.get("/health", async (_req, res) => {
+  const checks = {};
+
+  // SQLite check — synchronous and fast. Any failure here means the
+  // gateway cannot issue tokens or look up clients.
+  const dbStart = Date.now();
+  try {
+    const row = healthPingStmt.get();
+    checks.database = {
+      ok: row?.ok === 1,
+      latencyMs: Date.now() - dbStart,
+    };
+  } catch (err) {
+    checks.database = {
+      ok: false,
+      error: err?.message || String(err),
+      latencyMs: Date.now() - dbStart,
+    };
+  }
+
+  // Upstream probes — run in parallel so the overall health response
+  // completes in ~max(backend latency) rather than the sum.
+  if (BACKEND_SERVICES.length > 0) {
+    const results = await Promise.all(
+      BACKEND_SERVICES.map((s) => probeBackend(s)),
+    );
+    checks.backends = {};
+    for (const r of results) {
+      checks.backends[r.service] = r;
+    }
+  }
+
+  const allOk =
+    checks.database.ok &&
+    (!checks.backends ||
+      Object.values(checks.backends).every((b) => b.ok));
+
+  res.status(allOk ? 200 : 503).json({
+    status: allOk ? "ok" : "degraded",
+    checks,
+  });
+});
 
 // ── Login ───────────────────────────────────────────────────────────────────
 
@@ -319,6 +482,13 @@ app.post(
       });
       res.redirect(redirect || "/");
     } else {
+      logJson({
+        level: "warn",
+        msg: "gateway login failed",
+        srcIp: req.ip,
+        username: typeof username === "string" ? username : null,
+        userAgent: req.headers["user-agent"],
+      });
       const r = encodeURIComponent(redirect || "/");
       res.redirect(`/login?error=1&redirect=${r}`);
     }
@@ -343,7 +513,14 @@ app.get("/.well-known/oauth-protected-resource*", (_req, res) => {
 app.use(
   "/api/oauth",
   (req, _res, next) => {
-    console.log(`[auth-gateway] ${req.method} ${req.originalUrl}`);
+    logJson({
+      level: "info",
+      msg: "oauth request",
+      method: req.method,
+      path: req.originalUrl,
+      srcIp: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
     next();
   },
   express.json(),
@@ -362,14 +539,64 @@ app.use("/.well-known", mcpAuth);
  * Paths listed in `PUBLIC_SERVICE_PATHS` bypass Bearer validation — the
  * upstream service is expected to handle those requests safely on its own
  * (e.g. OAuth consent callbacks secured by state/PKCE at the app layer).
+ *
+ * Every request — authenticated, unauthenticated, proxy errors, 401s —
+ * emits a single structured JSON log line on response finish. See the
+ * README for the log field contract.
  */
 async function validateAndProxy(req, res) {
+  const start = Date.now();
   const service = req.params.service;
   const isPublic = isPublicServicePath(service, req.path);
+  const mcpSessionId = req.headers["mcp-session-id"] || null;
+  const hasBearer = (req.headers.authorization || "")
+    .toLowerCase()
+    .startsWith("bearer ");
+  const userAgent = req.headers["user-agent"];
 
+  // Mutable fields populated during the proxy lifecycle. Captured in the
+  // single log line emitted on response finish.
+  let userId = null;
+  let upstreamStatus = null;
+  let upstreamError = null;
+  let authReason = null;
+
+  res.on("finish", () => {
+    logJson({
+      level: upstreamError || res.statusCode >= 500 ? "error" : "info",
+      msg: "proxy request",
+      srcIp: req.ip,
+      method: req.method,
+      path: req.originalUrl,
+      service,
+      public: isPublic,
+      hasBearer,
+      mcpSessionId,
+      userId,
+      status: res.statusCode,
+      upstreamStatus,
+      upstreamError,
+      authReason,
+      durationMs: Date.now() - start,
+      userAgent,
+    });
+  });
+
+  let session = null;
   if (!isPublic) {
-    const session = await validateToken(req);
+    session = await validateToken(req);
     if (!session) {
+      authReason = classify401(req);
+      logJson({
+        level: "warn",
+        msg: "auth rejected",
+        srcIp: req.ip,
+        method: req.method,
+        path: req.originalUrl,
+        service,
+        reason: authReason,
+        userAgent,
+      });
       res.writeHead(401, {
         "Content-Type": "application/json",
         "WWW-Authenticate": "Bearer",
@@ -382,14 +609,14 @@ async function validateAndProxy(req, res) {
         }),
       );
     }
+    // @mcpauth/auth's session shape isn't strictly documented; pull from
+    // the commonly-used fields without throwing if any are absent.
+    userId = session.user?.id || session.userId || session.sub || null;
   }
 
   const targetHost = `${service}${INTERNAL_SUFFIX}`;
   const targetPath = req.url || "/";
-
-  console.log(
-    `[proxy]${isPublic ? " (public)" : ""} ${service}: ${req.method} ${targetPath} → ${targetHost}:${INTERNAL_PORT}`,
-  );
+  const targetUrl = `http://${targetHost}:${INTERNAL_PORT}${targetPath}`;
 
   const proxyReq = httpRequest(
     {
@@ -400,22 +627,61 @@ async function validateAndProxy(req, res) {
       headers: { ...req.headers, host: `${targetHost}:${INTERNAL_PORT}` },
     },
     (proxyRes) => {
+      upstreamStatus = proxyRes.statusCode;
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.pipe(res, { end: true });
     },
   );
 
+  // Explicit socket timeout. Without this, Node's socket can hang
+  // forever if the upstream accepts the TCP connection but never
+  // responds — which is exactly what caused the 15-minute 502s seen
+  // on 17 / 24 April 2026 against gmail-mcp.
+  proxyReq.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+    proxyReq.destroy(
+      Object.assign(new Error("upstream timeout"), {
+        code: "UPSTREAM_TIMEOUT",
+      }),
+    );
+  });
+
   proxyReq.on("error", (err) => {
-    console.error(`[proxy] ${service}: ${err.code || "UNKNOWN"} → ${targetHost}:${INTERNAL_PORT}${targetPath} — ${err.message}`);
+    const errorKind = classifyUpstreamError(err);
+    upstreamError = errorKind;
+    const waitedMs = Date.now() - start;
+    logJson({
+      level: "error",
+      msg: "upstream error",
+      service,
+      targetUrl,
+      errorKind,
+      errorCode: err.code || null,
+      errorMessage: err.message,
+      waitedMs,
+      timeoutMs: UPSTREAM_TIMEOUT_MS,
+    });
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
           jsonrpc: "2.0",
-          error: { code: -32000, message: "Service unavailable" },
+          error: {
+            code: -32000,
+            message:
+              errorKind === "upstream-timeout" || errorKind === "socket-timeout"
+                ? "Upstream timeout"
+                : "Service unavailable",
+          },
           id: null,
         }),
       );
+    } else {
+      // Headers already flushed — best we can do is abort the response.
+      try {
+        res.destroy(err);
+      } catch {
+        // no-op — response may already be closed.
+      }
     }
   });
 
@@ -426,13 +692,22 @@ app.use("/:service", validateAndProxy);
 
 // ── Start ───────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
-  console.log(`[auth-gateway] Listening on port ${PORT}`);
-  console.log(`[auth-gateway] Base URL: ${BASE_URL}`);
-  console.log(`[auth-gateway] OAuth: ${BASE_URL}/api/oauth/`);
-  console.log(
-    `[auth-gateway] Proxying /<service>/... → <service>${INTERNAL_SUFFIX}:${INTERNAL_PORT}/...`,
-  );
-});
+// Skip binding when imported by tests — exported `app` is used directly.
+if (process.env.NODE_ENV !== "test") {
+  app.listen(PORT, () => {
+    logJson({
+      level: "info",
+      msg: "auth gateway started",
+      port: Number(PORT),
+      baseUrl: BASE_URL,
+      accessTokenLifetimeSec: ACCESS_TOKEN_LIFETIME,
+      refreshTokenLifetimeSec: REFRESH_TOKEN_LIFETIME,
+      upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
+      backendServices: BACKEND_SERVICES,
+      internalSuffix: INTERNAL_SUFFIX,
+      internalPort: INTERNAL_PORT,
+    });
+  });
+}
 
 export { app };
