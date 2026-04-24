@@ -44,6 +44,10 @@ example, `/charlie/mcp` routes to `charlie-mcp.railway.internal:8000/mcp`.
 | `INTERNAL_SUFFIX` | No | `-mcp.railway.internal` | Backend DNS suffix |
 | `INTERNAL_PORT` | No | `8000` | Backend port (must match backend services) |
 | `PUBLIC_SERVICE_PATHS` | No | _empty_ | Comma-separated `<service>:<path>` pairs proxied without Bearer auth (see below) |
+| `MCPAUTH_ACCESS_TOKEN_LIFETIME` | No | `86400` | Access token lifetime, seconds. See [Token lifetimes](#token-lifetimes). |
+| `UPSTREAM_TIMEOUT_MS` | No | `30000` | Proxy request timeout before returning 502 |
+| `BACKEND_SERVICES` | No | _empty_ | Comma-separated list of backend service names (without `-mcp` suffix) that `/health` should probe, e.g. `gmail,gmail-work,notion,xero` |
+| `HEALTH_CHECK_TIMEOUT_MS` | No | `2000` | Per-backend timeout for the `/health` readiness probe |
 
 ### Public service paths
 
@@ -193,3 +197,104 @@ npm start
 ```bash
 npm test
 ```
+
+## Observability
+
+### Structured request logs
+
+Every proxy request emits a single-line JSON log entry on response
+finish. Railway scrapes stdout, so these lines are directly queryable
+in the Railway logs UI.
+
+Fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `ts` | string | ISO-8601 timestamp |
+| `level` | string | `info` for 2xx/3xx/4xx, `error` for 5xx / upstream errors |
+| `msg` | string | Always `proxy request` for proxy logs |
+| `srcIp` | string | Client IP (honours `X-Forwarded-For` — `trust proxy` is on) |
+| `method` | string | HTTP method |
+| `path` | string | Gateway path, including query string |
+| `service` | string | Service segment (e.g. `gmail-work`) |
+| `public` | boolean | True if the path bypassed Bearer validation |
+| `hasBearer` | boolean | Whether the request carried a Bearer header (token value is **never** logged) |
+| `mcpSessionId` | string\|null | Value of the `Mcp-Session-Id` request header |
+| `userId` | string\|null | Subject from the validated OAuth token, if any |
+| `status` | number | Status returned to the client |
+| `upstreamStatus` | number\|null | Status returned by the upstream MCP service |
+| `upstreamError` | string\|null | `socket-timeout`, `upstream-timeout`, `connection-refused`, `connection-reset`, `host-unreachable`, `dns-failure`, or the raw errno code |
+| `authReason` | string\|null | `no-bearer-header` or `invalid-or-expired-token` on a 401; null otherwise |
+| `durationMs` | number | Time from request arrival to response finish |
+| `userAgent` | string | Client UA string |
+
+Bodies — request and response — are **never** logged. Gmail / Xero
+content is considered sensitive.
+
+In addition, the gateway emits a separate `auth rejected` log line
+the moment a Bearer validation fails, with `reason`, `srcIp`, `path`,
+and `userAgent`. This is the trail to grep when watching for
+credential stuffing or scanner traffic.
+
+### `/health` contract
+
+`GET /health` is a **readiness** probe. It returns:
+
+- `200` with `{"status":"ok","checks":{...}}` when all dependencies
+  are healthy
+- `503` with `{"status":"degraded","checks":{...}}` when any
+  dependency fails
+
+Checks performed:
+
+- `database` — `SELECT 1` against the SQLite database
+- `backends.<service>` (only if `BACKEND_SERVICES` is set) — `GET /`
+  to each listed backend, with `HEALTH_CHECK_TIMEOUT_MS` per probe
+
+`GET /` is kept as a trivial liveness probe (plain text `ok`) for
+fast Railway HTTP healthchecks.
+
+### Upstream timeouts
+
+All proxy requests are bounded by `UPSTREAM_TIMEOUT_MS` (default 30s)
+so the gateway does not hang indefinitely on an unresponsive backend.
+On timeout, the gateway returns `502` with JSON-RPC
+`{ "error": { "code": -32000, "message": "Upstream timeout" } }`, and
+emits an `upstream error` log line including `targetUrl`, `errorKind`,
+and `waitedMs`.
+
+### Token lifetimes
+
+| Token | Default | Env var | Notes |
+|---|---|---|---|
+| Access token | 24h (86400s) | `MCPAUTH_ACCESS_TOKEN_LIFETIME` | Override to shorten if you need tighter revocation windows |
+| Refresh token | 14d | _not configurable_ | Hard-coded in `server.mjs` |
+
+The 24-hour default is a tradeoff: longer-lived access tokens reduce
+session churn for long-running agent clients (Claude Desktop, Cursor)
+but give a larger blast radius if one leaks and a longer window
+before a compromised client gets cut off. If that tradeoff matters
+for your deployment, set `MCPAUTH_ACCESS_TOKEN_LIFETIME=3600` (or
+shorter) and rely on refresh-token rotation.
+
+## Smoke test
+
+`scripts/smoke-test.mjs` drives a minimal end-to-end sequence — health
+check, MCP `initialize`, `tools/list` — against a deployed gateway and
+reports per-step latency and status. Useful for post-deploy sanity
+checks and for reproducing the "400 after OAuth reconnect" failure
+mode.
+
+```bash
+BASE_URL=https://your-gateway.up.railway.app \
+BEARER_TOKEN=<paste access_token from POST /api/oauth/token> \
+SERVICE=gmail-work \
+npm run smoke
+```
+
+The script exits `0` when every step returned a non-5xx status AND
+the `initialize` response included an `Mcp-Session-Id` header;
+non-zero otherwise, so it can be wired into CI or a cron alert.
+The Bearer token is read from the environment and is never written
+to stdout. Response bodies are truncated to 500 characters to bound
+accidental leakage of upstream content.

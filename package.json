@@ -6,7 +6,8 @@
   "private": true,
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/gateway.test.mjs"
+    "test": "node --test 'test/**/*.test.mjs'",
+    "smoke": "node scripts/smoke-test.mjs"
   },
   "engines": {
     "node": ">=22"
