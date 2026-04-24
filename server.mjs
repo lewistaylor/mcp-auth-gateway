@@ -36,7 +36,7 @@ import { dirname } from "node:path";
 import {
   logJson,
   classifyUpstreamError,
-  classify401,
+  classify401Detailed,
 } from "./lib/observability.mjs";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -68,7 +68,22 @@ const ACCESS_TOKEN_LIFETIME = parseInt(
   process.env.MCPAUTH_ACCESS_TOKEN_LIFETIME || "86400",
   10,
 );
-const REFRESH_TOKEN_LIFETIME = 14 * 24 * 60 * 60; // 14 days
+
+/**
+ * Refresh token lifetime, in seconds. Default is 30 days (2592000).
+ * Overridable via MCPAUTH_REFRESH_TOKEN_LIFETIME for deployments that
+ * prefer shorter rotation windows.
+ *
+ * The previous hard-coded 14-day value caused users to hit the full
+ * OAuth flow every fortnight even on actively-used clients, which
+ * masked the access-token churn issue as a "Gmail dropped out again"
+ * symptom. Extending to 30 days matches what Claude / Cursor users
+ * typically expect from long-running agent sessions.
+ */
+const REFRESH_TOKEN_LIFETIME = parseInt(
+  process.env.MCPAUTH_REFRESH_TOKEN_LIFETIME || "2592000",
+  10,
+);
 
 /**
  * Upstream proxy timeout, in milliseconds. Applied via
@@ -228,6 +243,24 @@ const lookupStmt = lookupDb.prepare(
 // Prepared once for the health probe so we don't pay the prepare cost on
 // every /health request.
 const healthPingStmt = lookupDb.prepare("SELECT 1 AS ok");
+
+// Prepared once for the 401 classifier so each failed request does a
+// single indexed lookup (access_token is the PRIMARY KEY).
+const tokenLookupStmt = lookupDb.prepare(
+  "SELECT access_token_expires_at FROM oauth_token WHERE access_token = ?",
+);
+
+/**
+ * DB-backed lookup used by `classify401Detailed`. Returns `null` when
+ * the token is unknown to the gateway (never issued, revoked, or
+ * scanner garbage) and `{ expiresAt }` otherwise. Kept tiny so it's
+ * easy to swap for a test double.
+ */
+function lookupTokenForClassifier(token) {
+  const row = tokenLookupStmt.get(token);
+  if (!row) return null;
+  return { expiresAt: row.access_token_expires_at };
+}
 
 function clientRowToObject(row) {
   if (!row) return null;
@@ -586,7 +619,25 @@ async function validateAndProxy(req, res) {
   if (!isPublic) {
     session = await validateToken(req);
     if (!session) {
-      authReason = classify401(req);
+      // Run the detailed classifier against our own token store so the
+      // audit log distinguishes the four operationally-meaningful cases:
+      //   - no-bearer-header  → client is not even trying to auth
+      //                         (scanner / misconfigured integration)
+      //   - malformed-bearer  → `Bearer<space>` with empty value
+      //   - unknown-to-db     → token never issued here, or already
+      //                         revoked / DB wiped (credential stuffing,
+      //                         stale client, cross-environment leak)
+      //   - expired           → token was valid once — this is the
+      //                         "Gmail drops out" case: a client that
+      //                         failed to refresh in time
+      //   - lookup-failed     → DB error during auth — real infra issue
+      //   - bad-expiry        → stored expires_at is unparseable
+      // NEVER log the token itself — only its 6-char prefix for
+      // correlating repeat offenders in the log stream.
+      const detail = classify401Detailed(req, {
+        lookupToken: lookupTokenForClassifier,
+      });
+      authReason = detail.reason;
       logJson({
         level: "warn",
         msg: "auth rejected",
@@ -595,6 +646,8 @@ async function validateAndProxy(req, res) {
         path: req.originalUrl,
         service,
         reason: authReason,
+        hasBearer: detail.hasBearer,
+        tokenPrefix: detail.tokenPrefix,
         userAgent,
       });
       res.writeHead(401, {

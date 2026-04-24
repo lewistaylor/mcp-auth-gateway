@@ -7,6 +7,42 @@ and this project adheres loosely to [SemVer](https://semver.org/). Since
 the gateway is self-hosted with a single consumer, version bumps track
 deployments rather than a formal release cadence.
 
+## [Unreleased] — 2026-04-24 — Richer 401 classification + refresh-token config
+
+Follow-up to the observability PR, motivated by the recurring "Gmail
+drops out for the user" symptom.
+
+### Added
+
+- **Detailed 401 classification** — `classify401Detailed` looks the
+  presented token up in `oauth_token` and buckets the rejection into
+  one of six reasons: `no-bearer-header`, `malformed-bearer`,
+  `unknown-to-db`, `expired`, `lookup-failed`, `bad-expiry`. The
+  `auth rejected` log line now also carries `hasBearer` and a
+  6-character `tokenPrefix` (never the full token) for correlating
+  repeat offenders in the log stream.
+- **`MCPAUTH_REFRESH_TOKEN_LIFETIME` env var** — default 30 days
+  (2592000 s), up from the previously hard-coded 14 days.
+  Governing how often a long-running client is forced through the
+  full OAuth flow.
+
+### Changed
+
+- Refresh token default lifetime **14 d → 30 d**.
+- The coarse `classify401` helper now also returns `malformed-bearer`
+  when the header is `Bearer<space>` with an empty token.
+
+### Why
+
+Before this change the only way to tell "Claude failed to refresh in
+time" apart from "someone is probing our gateway with a garbage
+token" was to read the TCP-level traffic. With the new classifier we
+can answer that question with a one-line `grep` against Railway
+logs, which is a prerequisite to actually reducing the frequency of
+the symptom.
+
+---
+
 ## [Unreleased] — 2026-04-24 — Observability
 
 Motivated by two incidents on 17 and 24 April 2026:
