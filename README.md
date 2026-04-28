@@ -284,6 +284,44 @@ On timeout, the gateway returns `502` with JSON-RPC
 emits an `upstream error` log line including `targetUrl`, `errorKind`,
 and `waitedMs`.
 
+### Sessions and the `-32002` contract
+
+Backend MCP services keep their session map **in memory**, so every
+Railway redeploy of an upstream service (gmail-mcp, notion-mcp, …)
+wipes every active session for that service. This is an explicit
+design choice — the alternative would be wiring Redis or Postgres
+into every backend just to survive deploys, which is a lot of moving
+parts for a self-hosted gateway.
+
+What makes the wipe survivable is the streamable HTTP transport's
+`-32002 "Session terminated"` signal. Three cases, one contract:
+
+1. **Idle session reap (TTL).** Backend returns `404 + JSON-RPC
+   -32002`; gateway forwards it verbatim. Client reinitializes.
+2. **Upstream redeploy completed.** New container has an empty session
+   map, sees the client's stale `Mcp-Session-Id`, returns `404 +
+   -32002`; gateway forwards it verbatim. Client reinitializes.
+3. **Upstream redeploy in flight.** Old container is gone, new one
+   isn't listening yet, so the gateway sees `ECONNREFUSED` /
+   `ECONNRESET` / `ENOTFOUND` / timeout. **The gateway synthesizes
+   `404 + -32002` itself** — but only when the request carried an
+   `Mcp-Session-Id`. Without a session id (i.e. an `initialize`
+   attempt), the gateway returns the truthful `502 + -32000` because
+   there is no session to terminate and the client cannot do anything
+   useful with a fake -32002.
+
+Cases 1, 2, and 3 are byte-for-byte indistinguishable to the MCP
+client, which means Claude / Cursor recover automatically across an
+upstream redeploy. Synthesis events show up in the request log as
+`msg:"synthesized session-terminated"` so operators can spot redeploy
+windows.
+
+The recoverable error categories are pinned in
+`lib/jsonrpc.mjs → RECOVERABLE_UPSTREAM_ERRORS`. Add new categories
+deliberately — anything in that set is presented to the client as
+"your session is gone", and lying about that would put clients into a
+reinit loop.
+
 ### Token lifetimes
 
 | Token | Default | Env var | Notes |

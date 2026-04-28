@@ -38,6 +38,11 @@ import {
   classifyUpstreamError,
   classify401Detailed,
 } from "./lib/observability.mjs";
+import {
+  shouldSynthesizeSessionTerminated,
+  buildSessionTerminatedBody,
+  buildUpstreamErrorBody,
+} from "./lib/jsonrpc.mjs";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -680,8 +685,44 @@ async function validateAndProxy(req, res) {
       headers: { ...req.headers, host: `${targetHost}:${INTERNAL_PORT}` },
     },
     (proxyRes) => {
+      // Forward upstream status + headers verbatim. This is critical for
+      // the streamable HTTP MCP transport's session lifecycle: the
+      // upstream emits `404 + JSON-RPC -32002 "Session terminated"` when
+      // it sees a stale `Mcp-Session-Id` (idle reap or process restart),
+      // and the client uses exactly those bytes to drive automatic
+      // reinitialize. If the gateway ever rewrote that 404 into a 502
+      // the client would get stuck — see the redeploy-recovery test in
+      // test/gateway.test.mjs.
       upstreamStatus = proxyRes.statusCode;
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
+
+      // Surface mid-stream errors on the upstream response so they
+      // reach the request log instead of being swallowed by `pipe`.
+      // We do NOT rewrite the response status here — by the time
+      // proxyRes is in flight, headers have been flushed and any
+      // attempt to overwrite the status would either no-op or throw.
+      // Aborting the response is the truthful behaviour: the client
+      // sees a truncated body and treats it as a transport failure,
+      // which is what actually happened.
+      proxyRes.on("error", (err) => {
+        const errorKind = classifyUpstreamError(err);
+        upstreamError = upstreamError || errorKind;
+        logJson({
+          level: "error",
+          msg: "upstream response error",
+          service,
+          targetUrl,
+          errorKind,
+          errorCode: err.code || null,
+          errorMessage: err.message,
+        });
+        try {
+          res.destroy(err);
+        } catch {
+          // no-op — response may already be closed.
+        }
+      });
+
       proxyRes.pipe(res, { end: true });
     },
   );
@@ -714,19 +755,46 @@ async function validateAndProxy(req, res) {
       timeoutMs: UPSTREAM_TIMEOUT_MS,
     });
     if (!res.headersSent) {
+      // The hot path that keeps clients alive across an upstream
+      // redeploy. When the upstream is briefly unreachable AND the
+      // client carried an `Mcp-Session-Id`, synthesize the same
+      // `404 + -32002 "Session terminated"` body the upstream itself
+      // would emit once it comes back up with an empty session map.
+      // The MCP client (Claude / Cursor) pattern-matches on -32002
+      // and reinitializes automatically. Without this branch the
+      // gateway returned 502 + -32000, which clients have no recovery
+      // path for — so a 30-second redeploy turned into a permanent
+      // dead session until the user manually reconnected.
+      //
+      // In-memory sessions are an explicit design choice (see README
+      // → "Sessions and the -32002 contract"); -32002 forwarding is
+      // the reason we get away with it.
+      const synthesize = shouldSynthesizeSessionTerminated(
+        errorKind,
+        mcpSessionId,
+      );
+      if (synthesize) {
+        logJson({
+          level: "info",
+          msg: "synthesized session-terminated",
+          service,
+          targetUrl,
+          errorKind,
+          mcpSessionId,
+          waitedMs,
+        });
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(buildSessionTerminatedBody(null));
+        return;
+      }
+
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message:
-              errorKind === "upstream-timeout" || errorKind === "socket-timeout"
-                ? "Upstream timeout"
-                : "Service unavailable",
-          },
-          id: null,
-        }),
+        buildUpstreamErrorBody(
+          errorKind === "upstream-timeout" || errorKind === "socket-timeout"
+            ? "Upstream timeout"
+            : "Service unavailable",
+        ),
       );
     } else {
       // Headers already flushed — best we can do is abort the response.

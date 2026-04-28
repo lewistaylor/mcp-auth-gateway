@@ -7,6 +7,70 @@ and this project adheres loosely to [SemVer](https://semver.org/). Since
 the gateway is self-hosted with a single consumer, version bumps track
 deployments rather than a formal release cadence.
 
+## [Unreleased] — 2026-04-28 — Redeploy-survivable sessions via `-32002` synthesis
+
+Two related symptoms, one fix:
+
+1. **The upstream returned `404 + JSON-RPC -32002 "Session terminated"`
+   and clients didn't see it.** The gateway already piped the response
+   through, but the proxy error path lacked test coverage and the
+   upstream-passthrough behaviour wasn't pinned. A future refactor
+   could quietly break it.
+2. **Sessions are in-memory; every Railway redeploy wipes them.** During
+   the brief window where the upstream is unreachable, the gateway
+   returned `502 + -32000`. MCP clients (Claude, Cursor) have no
+   recovery path for that, so a 30-second redeploy turned into a
+   permanent dead session until the user manually reconnected.
+
+### Added
+
+- **`lib/jsonrpc.mjs`** — small pure helpers exporting
+  `JSONRPC_SESSION_TERMINATED` (-32002), `JSONRPC_INTERNAL_ERROR`
+  (-32000), `RECOVERABLE_UPSTREAM_ERRORS` (the upstream failure modes
+  that should be presented as "session terminated"),
+  `shouldSynthesizeSessionTerminated`, `buildSessionTerminatedBody`,
+  and `buildUpstreamErrorBody`.
+- **Synthesized `404 + -32002` on upstream-unreachable.** When the
+  proxy connection fails with one of the recoverable error kinds
+  (`connection-refused`, `connection-reset`, `host-unreachable`,
+  `dns-failure`, `socket-timeout`, `upstream-timeout`) **AND** the
+  request carried an `Mcp-Session-Id`, the gateway now returns the
+  same body the upstream itself would emit once it comes back up.
+  Logs the event as `msg:"synthesized session-terminated"` so it's
+  greppable.
+- **Integration tests** for upstream 404 + -32002 passthrough (status,
+  body, headers — including the JSON-RPC `id` echo) and for the
+  synthesis path against a non-listening port (proves
+  ECONNREFUSED-with-session synthesizes -32002 and the no-session-id
+  case still returns the truthful 502).
+- **Unit tests** (`test/jsonrpc.test.mjs`) pinning the wire constants,
+  the `RECOVERABLE_UPSTREAM_ERRORS` set, and the synthesis predicate.
+
+### Changed
+
+- The 502 / `-32000` error body is now produced via
+  `buildUpstreamErrorBody` instead of an inline string-concat, so the
+  shape stays consistent with the synthesized -32002 body.
+- Added an explicit `proxyRes.on('error')` handler in
+  `validateAndProxy` so mid-stream upstream errors are logged with
+  classified `errorKind` instead of being silently swallowed by `pipe`.
+
+### Why
+
+In-memory sessions on the upstream backends are an intentional design
+choice (avoids a Redis dependency on every MCP service). The
+streamable HTTP transport's `-32002` signal is what makes that
+choice survivable across deploys — but only if the gateway emits it
+during the brief unreachable window too. Cases (a) idle session
+reap, (b) upstream redeploy completed, and (c) upstream redeploy in
+flight are now byte-for-byte indistinguishable to the MCP client,
+which is the contract Claude / Cursor need to recover automatically.
+
+See `README.md` → "Sessions and the `-32002` contract" for the full
+contract and the operator-facing log signal.
+
+---
+
 ## [Unreleased] — 2026-04-24 — Richer 401 classification + refresh-token config
 
 Follow-up to the observability PR, motivated by the recurring "Gmail
